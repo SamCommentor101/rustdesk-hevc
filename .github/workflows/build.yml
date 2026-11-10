@@ -1,8 +1,8 @@
+
 name: Build RustDesk with HEVC VA-API
 
-# Daily: if upstream RustDesk has a new release we haven't built, build it
-# with hwcodec's hevc_vaapi encoder re-enabled and publish the .deb as a
-# release named "<tag>-hevc".
+# Daily: build new upstream releases with HEVC VA-API enabled.
+# Publish both Debian and Fedora RPM packages.
 on:
   schedule:
     - cron: "17 9 * * *"
@@ -38,7 +38,9 @@ jobs:
         run: |
           TAG="$INPUT_TAG"
           [ -z "$TAG" ] && TAG=$(gh api repos/rustdesk/rustdesk/releases/latest -q .tag_name)
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
           if [ "$FORCE" != "true" ] && gh release view "$TAG-hevc" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Already built $TAG-hevc"
             echo "build=false" >> "$GITHUB_OUTPUT"
@@ -52,15 +54,20 @@ jobs:
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 360
+
     outputs:
       deb: ${{ steps.pkg.outputs.deb }}
+      rpm: ${{ steps.rpm.outputs.rpm }}
+
     env:
       TAG: ${{ needs.check.outputs.tag }}
       VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
     defaults:
       run:
         shell: bash
         working-directory: rustdesk
+
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v7
@@ -73,11 +80,12 @@ jobs:
         working-directory: .
         run: |
           sudo rm -rf /opt/ghc /usr/local/lib/android /usr/share/dotnet
-          sudo mkdir -p /opt/artifacts && sudo chown -R "$USER" /opt/artifacts
+          sudo mkdir -p /opt/artifacts
+          sudo chown -R "$USER" /opt/artifacts
           df -h /
 
       - name: Add swap
-        uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c # v1.0
+        uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c
         with:
           swap-size-gb: 12
 
@@ -94,11 +102,15 @@ jobs:
           path: rustdesk
           submodules: recursive
 
-      # Read toolchain pins from upstream's own workflows so version bumps
-      # in new releases are picked up automatically.
+      # Read toolchain pins from upstream workflows.
       - name: Read upstream version pins
         run: |
-          pin() { grep -m1 -E "^\s*$1:" ".github/workflows/$2" | sed -E 's/^[^:]*:\s*"?([^"#]*)"?.*/\1/' | xargs; }
+          pin() {
+            grep -m1 -E "^\s*$1:" ".github/workflows/$2" |
+            sed -E 's/^[^:]*:\s*"?([^"#]*)"?.*/\1/' |
+            xargs
+          }
+
           {
             echo "RUST_VERSION=$(pin RUST_VERSION flutter-build.yml)"
             echo "FLUTTER_VERSION=$(pin FLUTTER_VERSION flutter-build.yml)"
@@ -112,9 +124,9 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
-          # The runner image ships libunwind-14-dev, which conflicts with the
-          # libunwind-dev that libgstreamer1.0-dev pulls in.
+
           sudo apt-get remove -y libunwind-14-dev || true
+
           sudo apt-get install -y \
             build-essential clang cmake curl gcc git g++ \
             libayatana-appindicator3-dev libasound2-dev libclang-dev \
@@ -122,8 +134,11 @@ jobs:
             libgtk-3-dev libpam0g-dev libpulse-dev libva-dev \
             libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxdo-dev libxfixes-dev llvm-dev nasm ninja-build \
-            pkg-config python3 unzip wget xz-utils libssl-dev
-          # RustDesk links its own libopus from vcpkg.
+            pkg-config python3 unzip wget xz-utils libssl-dev \
+            rpm
+
+          command -v rpmbuild
+
           sudo apt-get remove -y libopus-dev || true
 
       - name: Install Rust ${{ env.RUST_VERSION }}
@@ -133,17 +148,31 @@ jobs:
           targets: x86_64-unknown-linux-gnu
           components: rustfmt
 
+      # Re-enable HEVC VA-API in hwcodec.
       - name: Re-enable hevc_vaapi in hwcodec
         run: |
-          REV=$(grep -A2 '^name = "hwcodec"' Cargo.lock | sed -nE 's/.*hwcodec#([0-9a-f]+)".*/\1/p')
+          REV=$(grep -A2 '^name = "hwcodec"' Cargo.lock |
+            sed -nE 's/.*hwcodec#([0-9a-f]+)".*/\1/p')
+
+          test -n "$REV"
+
           echo "hwcodec rev: $REV"
+
           git clone https://github.com/rustdesk-org/hwcodec /tmp/hwcodec-hevc
+
           git -C /tmp/hwcodec-hevc checkout "$REV"
           git -C /tmp/hwcodec-hevc submodule update --init --recursive
-          python3 ../hevc/patch_hwcodec.py /tmp/hwcodec-hevc/src/ffmpeg_ram/encode.rs
+
+          python3 ../hevc/patch_hwcodec.py \
+            /tmp/hwcodec-hevc/src/ffmpeg_ram/encode.rs
+
           printf '\n[patch."https://github.com/rustdesk-org/hwcodec"]\nhwcodec = { path = "/tmp/hwcodec-hevc" }\n' >> Cargo.toml
+
           cargo update -p hwcodec
-          cargo tree -i hwcodec --features hwcodec,flutter | head -1 | tee /dev/stderr | grep -q '/tmp/hwcodec-hevc'
+
+          cargo tree -i hwcodec --features hwcodec,flutter |
+            head -1 | tee /dev/stderr |
+            grep -q '/tmp/hwcodec-hevc'
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -151,7 +180,7 @@ jobs:
           prefix-key: hevc-${{ env.RUST_VERSION }}
           cache-on-failure: true
 
-      # --- flutter_rust_bridge codegen (mirrors upstream bridge.yml) ---
+      # Flutter bridge code generation.
       - name: Install Flutter ${{ env.BRIDGE_FLUTTER_VERSION }} for bridge codegen
         uses: subosito/flutter-action@v2
         with:
@@ -161,19 +190,26 @@ jobs:
       - name: Generate flutter-rust bridge
         run: |
           cargo install cargo-expand --version "$CARGO_EXPAND_VERSION" --locked
-          cargo install flutter_rust_bridge_codegen --version "$FRB_VERSION" --features uuid --locked
-          # Same pubspec tweak upstream applies for the older bridge Flutter.
-          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+
+          cargo install flutter_rust_bridge_codegen \
+            --version "$FRB_VERSION" --features uuid --locked
+
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' \
+            flutter/pubspec.yaml
+
           (cd flutter && flutter pub get)
-          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs \
+
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
             --dart-output ./flutter/lib/generated_bridge.dart \
             --c-output ./flutter/macos/Runner/bridge_generated.h
-          # Undo the codegen-only pubspec tweak before the real Flutter build.
+
           git checkout -- flutter/pubspec.yaml
           git checkout -- flutter/pubspec.lock 2>/dev/null || true
+
           ls -l src/bridge_generated*.rs flutter/lib/generated_bridge*.dart
 
-      # --- vcpkg (FFmpeg etc.) ---
+      # vcpkg dependencies.
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
         with:
@@ -183,43 +219,111 @@ jobs:
 
       - name: Install vcpkg dependencies
         run: |
-          if ! "$VCPKG_ROOT/vcpkg" install --triplet x64-linux --x-install-root="$VCPKG_ROOT/installed"; then
-            find "$VCPKG_ROOT/buildtrees" -name "*.log" -exec tail -n 50 {} + || true
+          if ! "$VCPKG_ROOT/vcpkg" install \
+            --triplet x64-linux \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+
+            find "$VCPKG_ROOT/buildtrees" -name "*.log" \
+              -exec tail -n 50 {} + || true
+
             exit 1
           fi
 
-      # --- Rust library ---
+      # Rust library.
       - name: Build librustdesk
         run: |
           export VCPKG_ROOT=/opt/artifacts/vcpkg
-          sed -i 's/\["cdylib", "staticlib", "rlib"\]/["cdylib"]/g' Cargo.toml
-          cargo build --lib --features hwcodec,flutter,unix-file-copy-paste --release
 
-      # --- Flutter app + .deb ---
-      - name: Build Flutter app and .deb
+          sed -i 's/\["cdylib", "staticlib", "rlib"\]/["cdylib"]/g' Cargo.toml
+
+          cargo build --lib \
+            --features hwcodec,flutter,unix-file-copy-paste \
+            --release
+
+      # Flutter application and Debian package.
+      - name: Build Flutter app and DEB
         id: pkg
         run: |
           pushd "$RUNNER_TEMP"
+
           wget -q "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+
           tar xf "flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+
           popd
+
           git config --global --add safe.directory '*'
-          if [ "$FLUTTER_VERSION" = "3.24.5" ] && [ -f .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff ]; then
-            (cd "$RUNNER_TEMP/flutter" && git apply "$GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff")
+
+          if [ "$FLUTTER_VERSION" = "3.24.5" ] && \
+             [ -f .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff ]; then
+
+            (cd "$RUNNER_TEMP/flutter" && \
+              git apply "$GITHUB_WORKSPACE/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff")
           fi
-          # Put the release Flutter ahead of the bridge-codegen Flutter on PATH.
-          export PATH=$RUNNER_TEMP/flutter/bin:$PATH
+
+          export PATH="$RUNNER_TEMP/flutter/bin:$PATH"
+
           flutter --version
-          export CARGO_INCREMENTAL=0 DEB_ARCH=amd64
+
+          export CARGO_INCREMENTAL=0
+          export DEB_ARCH=amd64
+
           python3 ./build.py --flutter --skip-cargo
+
           ls -l rustdesk*.deb
+
           DEB=$(ls rustdesk*.deb | head -1)
+
           mv "$DEB" "rustdesk-${VERSION}-x86_64-hevc.deb"
-          dpkg-deb -c "rustdesk-${VERSION}-x86_64-hevc.deb" > "$RUNNER_TEMP/deb-contents.txt"
-          grep 'usr/share/rustdesk/lib/librustdesk.so' "$RUNNER_TEMP/deb-contents.txt"
+
+          dpkg-deb -c "rustdesk-${VERSION}-x86_64-hevc.deb" \
+            > "$RUNNER_TEMP/deb-contents.txt"
+
+          grep 'usr/share/rustdesk/lib/librustdesk.so' \
+            "$RUNNER_TEMP/deb-contents.txt"
+
           echo "deb=rustdesk-${VERSION}-x86_64-hevc.deb" >> "$GITHUB_OUTPUT"
 
-      - name: Upload .deb for testing and publishing
+      # Build RPM from the same Flutter bundle.
+      - name: Build Fedora RPM
+        id: rpm
+        run: |
+          echo "Preparing RPM specification"
+
+          test -f res/rpm-flutter.spec
+
+          # Update RPM version to match the upstream RustDesk release.
+          sed -i -E "s/^Version:.*/Version: ${VERSION}/" \
+            res/rpm-flutter.spec
+
+          grep -E '^(Name|Version|Release):' res/rpm-flutter.spec
+
+          # Remove old RPM outputs.
+          rm -rf "$HOME/rpmbuild"
+
+          # Build the RPM using RustDesk's own Flutter RPM specification.
+          HBB="$GITHUB_WORKSPACE/rustdesk" \
+            rpmbuild -bb res/rpm-flutter.spec
+
+          # Locate the generated RPM.
+          RPM=$(find "$HOME/rpmbuild/RPMS" \
+            -type f -name '*.rpm' -print -quit)
+
+          if [ -z "$RPM" ]; then
+            echo "ERROR: RPM was not generated"
+            exit 1
+          fi
+
+          mkdir -p rpm-output
+
+          cp "$RPM" "rpm-output/rustdesk-${VERSION}-x86_64-hevc.rpm"
+
+          echo "rpm=rustdesk-${VERSION}-x86_64-hevc.rpm" >> "$GITHUB_OUTPUT"
+
+          ls -lh rpm-output/
+
+      # Upload Debian package.
+      - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
           name: deb
@@ -227,20 +331,31 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Install the freshly built package on clean Ubuntu images and make sure it
-  # starts. This cannot test GPU encoding (no GPU on hosted runners); it only
-  # stops a package that won't install or launch from being published.
+      # Upload RPM package.
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: rustdesk/rpm-output/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
+  # Existing Ubuntu smoke tests for the Debian package.
   smoke:
     needs: build
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         image: ["ubuntu:22.04", "ubuntu:24.04"]
+
     container:
       image: ${{ matrix.image }}
+
     env:
       DEBIAN_FRONTEND: noninteractive
+
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -254,13 +369,20 @@ jobs:
 
       - name: Check every shared library resolves
         run: |
-          # Plugins find libflutter_linux_gtk.so next to themselves at runtime.
           export LD_LIBRARY_PATH=/usr/share/rustdesk/lib
+
           missing=0
+
           for f in /usr/share/rustdesk/rustdesk /usr/share/rustdesk/lib/*.so; do
             out=$(ldd "$f" 2>&1 | grep 'not found' || true)
-            if [ -n "$out" ]; then echo "== $f"; echo "$out"; missing=1; fi
+
+            if [ -n "$out" ]; then
+              echo "== $f"
+              echo "$out"
+              missing=1
+            fi
           done
+
           exit $missing
 
       - name: Program starts and reports its version
@@ -268,8 +390,11 @@ jobs:
           VERSION: ${{ needs.build.outputs.deb }}
         run: |
           want=$(echo "$VERSION" | sed -E 's/^rustdesk-([0-9.]+)-.*/\1/')
+
           got=$(env -u DISPLAY /usr/share/rustdesk/rustdesk --version)
+
           echo "expected $want, got $got"
+
           [ "$got" = "$want" ]
 
       - name: Package contents look right
@@ -279,22 +404,35 @@ jobs:
           test -f /usr/share/rustdesk/files/systemd/rustdesk.service
           test -L /usr/bin/rustdesk
 
+  # Publish both packages.
   publish:
     needs: [check, build, smoke]
     runs-on: ubuntu-latest
+
     env:
       TAG: ${{ needs.check.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download DEB artifact
+        uses: actions/download-artifact@v4
         with:
           name: deb
           path: pkg
 
+      - name: Download RPM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rpm
+          path: pkg
+
       - name: Publish release
         run: |
-          gh release delete "$TAG-hevc" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG-hevc" pkg/*.deb \
-            -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          gh release delete "$TAG-hevc" \
+            -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create "$TAG-hevc" pkg/*.deb pkg/*.rpm \
+            -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             --title "RustDesk $TAG (HEVC VA-API)" \
-            --notes "Upstream RustDesk $TAG built with hwcodec's hevc_vaapi encoder re-enabled on Linux."
+            --notes "Upstream RustDesk $TAG built with hwcodec's hevc_vaapi encoder re-enabled on Linux. Includes Debian and Fedora RPM packages."
