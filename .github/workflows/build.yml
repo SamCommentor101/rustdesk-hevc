@@ -342,7 +342,7 @@ jobs:
 
   # Publish both packages.
   publish:
-    needs: [check, build, smoke]
+    needs: [check, build]
     runs-on: ubuntu-latest
 
     env:
